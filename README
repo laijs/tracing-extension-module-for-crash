@@ -1,0 +1,139 @@
+
+Author: Lai Jiangshan <laijs@cn.fujitsu.com>
+
+This extension module enables crash to analyze tracing from core-file
+and make tracing can act as a flight recorder. It helps us find
+what have happen from the sequence of events before panic.
+It makes the core-file is not just a system snapshot on panic time.
+
+Use this module:
+1) Put the extensions/trace.c file in the <crash_src_dir>/extensions
+2) Enter "make extensions" from the top-level to build it. It creates
+   "trace.so" in the "extensions" subdirectory.
+
+3) (when you are using crash and you need this module)
+   Use the "extend" command to load the "trace.so" extension module:
+
+crash> extend <path-to>/trace.so
+
+   A command "trace" will be added after loaded.
+
+4) Use the "extend -u" to unload it when you don't need it:
+
+crash> extend -u <path-to>/trace.so
+
+Use "trace" command:
+crash> help trace
+
+NAME
+  trace - show or dump the tracing info
+
+SYNOPSIS
+  trace [ <show [-c <cpulist>] [-f [no]<flagname>]> | <dump [-sm] <dest-dir>> ]
+DESCRIPTION
+trace
+    shows the current tracer and other informations.
+
+trace show [ -c <cpulist> ] [ -f [no]<flagename> ]
+    shows all events with readability text(sorted by timestamp)
+    -c: only shows specified CPUs' events.
+        ex. trace show -c 1,2    - only shows cpu#1 and cpu#2 's events.
+            trace show -c 0,2-7  - only shows cpu#0, cpu#2...cpu#7's events.
+    -f: set or clear a flag
+        available flags            default
+        context_info               true
+        sym_offset                 false
+        sym_addr                   false
+        graph_print_duration       true
+        graph_print_overhead       true
+        graph_print_abstime        false
+        graph_print_cpu            true
+        graph_print_proc           false
+        graph_print_overrun        false
+
+trace dump [-sm] <dest-dir>
+    dump ring_buffers to dest-dir. Then you can parse it
+    by other tracing tools. The dirs and files are generated
+    the same as debugfs/tracing.
+    -m: also dump metadata of ftrace.
+    -s: also dump symbols of the kernel <not implemented>.
+
+
+EXAMPLE, dump ring_buffer:
+
+crash > trace dump -m dumped_tracing
+(quit crash)
+# ls -R dumped_tracing
+dumped_tracing:
+events  per_cpu  saved_cmdlines
+dumped_tracing/events:
+block  ftrace  irq  kmem  sched  skb  workqueue
+
+dumped_tracing/events/block:
+block_bio_backmerge  block_bio_frontmerge  block_plug      block_rq_complete  block_rq_requeue  block_unplug_io
+block_bio_bounce     block_bio_queue       block_remap     block_rq_insert    block_sleeprq     block_unplug_timer
+block_bio_complete   block_getrq           block_rq_abort  block_rq_issue     block_split
+
+dumped_tracing/events/block/block_bio_backmerge:
+format
+
+dumped_tracing/events/block/block_bio_bounce:
+format
+....
+dumped_tracing/per_cpu:
+cpu0  cpu1
+dumped_tracing/per_cpu/cpu0:
+trace_pipe_raw
+
+dumped_tracing/per_cpu/cpu1:
+trace_pipe_raw
+
+
+EXAMPLE, shows function tracer 
+crash > trace show
+           <...>-3677  [001]  6094.628402: pick_next_task_fair <-schedule
+           <...>-3677  [001]  6094.628403: pick_next_task_rt <-schedule
+           <...>-3677  [001]  6094.628404: pick_next_task_fair <-schedule
+           <...>-3677  [001]  6094.628405: pick_next_task_idle <-schedule
+           <...>-3677  [001]  6094.628406: calc_load_account_active <-pick_next_task_idle
+           <...>-3677  [001]  6094.628407: perf_counter_task_sched_out <-schedule
+       <swapper>-0     [001]  6094.628437: finish_task_switch <-schedule
+       <swapper>-0     [001]  6094.628438: perf_counter_task_sched_in <-finish_task_switch
+       <swapper>-0     [001]  6094.628439: _spin_unlock_irq <-finish_task_switch
+       <swapper>-0     [001]  6094.628440: kretprobe_table_lock_ptr <-kretprobe_table_lock
+       <swapper>-0     [001]  6094.628442: _spin_lock_irqsave <-kretprobe_table_lock
+....
+            bash-3580  [000]  6119.756585: native_apic_mem_read <-default_get_apic_id
+            bash-3580  [000]  6119.756616: crash_save_cpu <-native_machine_crash_shutdown
+            bash-3580  [000]  6119.756687: append_elf_note <-crash_save_cpu
+            bash-3580  [000]  6119.756688: strlen <-append_elf_note
+            bash-3580  [000]  6119.756712: final_note <-crash_save_cpu
+            bash-3580  [000]  6119.756776: machine_kexec <-crash_kexec
+            bash-3580  [000]  6119.756824: page_address <-machine_kexec
+EXAMPLE, shows function_graph tracer
+crash > trace show
+ 1)   1.187 us    |            }
+ 1)               |            hrtimer_forward() {
+ 1)   1.018 us    |              ktime_add_safe();
+ 1)   0.953 us    |              ktime_add_safe();
+ 1)   5.419 us    |            }
+ 1) + 87.322 us   |          }
+ 1)   1.028 us    |          _spin_lock();
+ 1)   1.779 us    |          enqueue_hrtimer();
+ 1) ! 100.743 us  |        }
+ 1)   1.043 us    |        _spin_unlock();
+ 1)               |        tick_program_event() {
+ 1)               |          tick_dev_program_event() {
+ 1)   1.148 us    |            ktime_get();
+EXAMPLE, shows various events
+crash > trace show
+       <swapper>-0     [001]  9349.585217: softirq_exit: vec=1
+       <swapper>-0     [001]  9349.585218: softirq_entry: vec=8
+       <swapper>-0     [001]  9349.585226: kmem_cache_free: call_site=c015a221 ptr=0xcfb16200
+       <swapper>-0     [001]  9349.585228: kmem_cache_free: call_site=c0151c32 ptr=0xcfb438c0
+       <swapper>-0     [001]  9349.585230: sched_process_free: task dhclient-script:3749 [120]
+       <swapper>-0     [001]  9349.585237: kfree: call_site=c017f13a ptr=(nil)
+       <swapper>-0     [001]  9349.585239: kmem_cache_free: call_site=c013b8f1 ptr=0xcf056ed0
+       <swapper>-0     [001]  9349.585241: softirq_exit: vec=8
+           <...>-3752  [000]  9349.585717: kmem_cache_alloc: call_site=c01b6a34 ptr=0xcf2c50b0 bytes_req=88 bytes_alloc=88 gfp_flags=80d0
+           <...>-3752  [000]  9349.585732: kmem_cache_alloc: call_site=c01b95fa ptr=0xcf2c61e0 bytes_req=12 bytes_alloc=16 gfp_flags=d0
