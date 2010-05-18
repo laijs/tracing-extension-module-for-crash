@@ -1,7 +1,7 @@
 /*
  * trace extension module for crash
  *
- * Copyright (C) 2009 FUJITSU LIMITED
+ * Copyright (C) 2009, 2010 FUJITSU LIMITED
  * Author: Lai Jiangshan <laijs@cn.fujitsu.com>
  *
  * This program is free software; you can redistribute it and/or modify
@@ -53,6 +53,7 @@ static int koffset(list_head, next);
 static int koffset(ftrace_event_call, list);
 static int koffset(ftrace_event_call, name);
 static int koffset(ftrace_event_call, system);
+static int koffset(ftrace_event_call, print_fmt);
 static int koffset(ftrace_event_call, id);
 static int koffset(ftrace_event_call, fields);
 
@@ -74,8 +75,11 @@ struct ring_buffer_per_cpu {
 	ulong reader_page;
 	ulong real_head_page;
 
-	ulong *pages;
 	int head_page_index;
+	ulong *pages;
+
+	ulong *linear_pages;
+	int nr_linear_pages;
 
 	ulong overrun;
 	ulong entries;
@@ -111,6 +115,22 @@ static void ftrace_show_destroy(void);
 
 /* Remove the "const" qualifiers for ptr */
 #define free(ptr) free((void *)(ptr))
+
+static int write_and_check(int fd, void *data, size_t size)
+{
+	size_t tot = 0;
+	size_t w;
+
+	do {
+		w = write(fd, data, size - tot);
+		tot += w;
+
+		if (w <= 0)
+			return -1;
+	} while (tot != size);
+
+	return 0;
+}
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -153,6 +173,7 @@ static void init_offsets(void)
 	init_offset(ftrace_event_call, list);
 	init_offset(ftrace_event_call, name);
 	init_offset(ftrace_event_call, system);
+	init_offset(ftrace_event_call, print_fmt);
 	init_offset(ftrace_event_call, id);
 	init_offset(ftrace_event_call, fields);
 
@@ -199,6 +220,7 @@ static void print_offsets(void)
 	print_offset(ftrace_event_call, list);
 	print_offset(ftrace_event_call, name);
 	print_offset(ftrace_event_call, system);
+	print_offset(ftrace_event_call, print_fmt);
 	print_offset(ftrace_event_call, id);
 	print_offset(ftrace_event_call, fields);
 
@@ -214,13 +236,19 @@ static void print_offsets(void)
 static int ftrace_init_pages(struct ring_buffer_per_cpu *cpu_buffer,
 		unsigned nr_pages)
 {
-	unsigned j = 0;
+	unsigned j = 0, count = 0;
 	ulong head, page;
 	ulong real_head_page = cpu_buffer->head_page;
 
 	cpu_buffer->pages = calloc(sizeof(ulong), nr_pages);
 	if (cpu_buffer->pages == NULL)
 		return -1;
+
+	cpu_buffer->linear_pages = calloc(sizeof(ulong), nr_pages + 1);
+	if (cpu_buffer->linear_pages == NULL) {
+		free(cpu_buffer->pages);
+		return -1;
+	}
 
 	if (lockless_ring_buffer) {
 		read_value(head, cpu_buffer->kaddr, ring_buffer_per_cpu, pages);
@@ -253,6 +281,8 @@ static int ftrace_init_pages(struct ring_buffer_per_cpu *cpu_buffer,
 		goto out_fail;
 	}
 
+	/* find head page and head_page_index */
+
 	cpu_buffer->real_head_page = real_head_page;
 	cpu_buffer->head_page_index = -1;
 
@@ -268,10 +298,38 @@ static int ftrace_init_pages(struct ring_buffer_per_cpu *cpu_buffer,
 		goto out_fail;
 	}
 
+	/* Setup linear pages */
+
+	cpu_buffer->linear_pages[count++] = cpu_buffer->reader_page;
+
+	if (cpu_buffer->reader_page == cpu_buffer->commit_page)
+		goto done;
+
+	j = cpu_buffer->head_page_index;
+	for (;;) {
+		cpu_buffer->linear_pages[count++] = cpu_buffer->pages[j];
+
+		if (cpu_buffer->pages[j] == cpu_buffer->commit_page)
+			break;
+
+		j++;
+		if (j == nr_pages)
+			j = 0;
+
+		if (j == cpu_buffer->head_page_index) {
+			/* cpu_buffer->commit_page may be corrupted */
+			break;
+		}
+	}
+
+done:
+	cpu_buffer->nr_linear_pages = count;
+
 	return 0;
 
 out_fail:
 	free(cpu_buffer->pages);
+	free(cpu_buffer->linear_pages);
 	return -1;
 }
 
@@ -284,6 +342,7 @@ static void ftrace_destroy_buffers(struct ring_buffer_per_cpu *buffers)
 			continue;
 
 		free(buffers[i].pages);
+		free(buffers[i].linear_pages);
 	}
 }
 
@@ -470,7 +529,7 @@ static void ftrace_destroy(void)
 	free(global_buffers);
 }
 
-static int ftrace_dump_page(FILE *out, ulong page, void *page_tmp)
+static int ftrace_dump_page(int fd, ulong page, void *page_tmp)
 {
 	ulong raw_page;
 
@@ -480,7 +539,8 @@ static int ftrace_dump_page(FILE *out, ulong page, void *page_tmp)
 			RETURN_ON_ERROR))
 		goto out_fail;
 
-	fwrite(page_tmp, 1, PAGESIZE(), out);
+	if (write_and_check(fd, page_tmp, PAGESIZE()))
+		return -1;
 
 	return 0;
 
@@ -489,33 +549,15 @@ out_fail:
 }
 
 static
-void ftrace_dump_buffer(FILE *out, struct ring_buffer_per_cpu *cpu_buffer,
+void ftrace_dump_buffer(int fd, struct ring_buffer_per_cpu *cpu_buffer,
 		unsigned pages, void *page_tmp)
 {
-	unsigned i;
+	int i;
 
-	if (ftrace_dump_page(out, cpu_buffer->reader_page, page_tmp) < 0)
-		return;
-
-	if (cpu_buffer->reader_page == cpu_buffer->commit_page)
-		return;
-
-	i = cpu_buffer->head_page_index;
-	for (;;) {
-		if (ftrace_dump_page(out, cpu_buffer->pages[i], page_tmp) < 0)
+	for (i = 0; i < cpu_buffer->nr_linear_pages; i++) {
+		if (ftrace_dump_page(fd, cpu_buffer->linear_pages[i],
+				page_tmp) < 0)
 			break;
-
-		if (cpu_buffer->pages[i] == cpu_buffer->commit_page)
-			break;
-
-		i++;
-		if (i == pages)
-			i = 0;
-
-		if (i == cpu_buffer->head_page_index) {
-			/* cpu_buffer->commit_page may be corrupted */
-			break;
-		}
 	}
 }
 
@@ -540,7 +582,7 @@ static int ftrace_dump_buffers(const char *per_cpu_path)
 	int i;
 	void *page_tmp;
 	char path[PATH_MAX];
-	FILE *out;
+	int fd;
 
 	page_tmp = malloc(PAGESIZE());
 	if (page_tmp == NULL)
@@ -558,12 +600,12 @@ static int ftrace_dump_buffers(const char *per_cpu_path)
 
 		snprintf(path, sizeof(path), "%s/cpu%d/trace_pipe_raw",
 				per_cpu_path, i);
-		out = fopen(path, "wb");
-		if (out == NULL)
+		fd = open(path, O_WRONLY | O_CREAT, 0644);
+		if (fd < 0)
 			goto out_fail;
 
-		ftrace_dump_buffer(out, cpu_buffer, global_pages, page_tmp);
-		fclose(out);
+		ftrace_dump_buffer(fd, cpu_buffer, global_pages, page_tmp);
+		close(fd);
 	}
 
 	free(page_tmp);
@@ -727,6 +769,7 @@ static void ftrace_destroy_event_types(void)
 		free(event_types[i]->fields);
 		free(event_types[i]->system);
 		free(event_types[i]->name);
+		free(event_types[i]->print_fmt);
 		free(event_types[i]);
 	}
 
@@ -746,8 +789,8 @@ static int ftrace_init_event_types(void)
 	read_value(event, ftrace_events, list_head, next);
 	while (event != ftrace_events) {
 		ulong call;
-		ulong name_addr, system_addr;
-		char name[128], system[128];
+		ulong name_addr, system_addr, print_fmt_addr;
+		char name[128], system[128], print_fmt[4096];
 		int id;
 
 		call = event - koffset(ftrace_event_call, list);
@@ -756,10 +799,13 @@ static int ftrace_init_event_types(void)
 		read_value(id, call, ftrace_event_call, id);
 		read_value(name_addr, call, ftrace_event_call, name);
 		read_value(system_addr, call, ftrace_event_call, system);
+		read_value(print_fmt_addr, call, ftrace_event_call, print_fmt);
 
 		if (!read_string(name_addr, name, 128))
 			goto out_fail;
 		if (!read_string(system_addr, system, 128))
+			goto out_fail;
+		if (!read_string(print_fmt_addr, print_fmt, 4096))
 			goto out_fail;
 
 		/* Enlarge event types array when need */
@@ -782,6 +828,7 @@ static int ftrace_init_event_types(void)
 
 		aevent_type->system = strdup(system);
 		aevent_type->name = strdup(name);
+		aevent_type->print_fmt = strdup(print_fmt);
 		aevent_type->id = id;
 		aevent_type->nfields = 0;
 		aevent_type->fields = NULL;
@@ -812,6 +859,7 @@ static int ftrace_init_event_types(void)
 out_fail_free_aevent_type:
 	free(aevent_type->system);
 	free(aevent_type->name);
+	free(aevent_type->print_fmt);
 	free(aevent_type);
 out_fail:
 	ftrace_destroy_event_types();
@@ -868,6 +916,7 @@ static int ftrace_dump_event_type(struct event_type *t, const char *path)
 	char format_path[PATH_MAX];
 	FILE *out;
 	int i;
+	int common_field_count = 5;
 
 	snprintf(format_path, sizeof(format_path), "%s/format", path);
 	out = fopen(format_path, "w");
@@ -878,15 +927,40 @@ static int ftrace_dump_event_type(struct event_type *t, const char *path)
 	fprintf(out, "ID: %d\n", t->id);
 	fprintf(out, "format:\n");
 
-	for (i = 0; i < t->nfields; i++) {
-		struct ftrace_field *f = &t->fields[i];
+	for (i = t->nfields - 1; i >= 0; i--) {
+		/*
+		 * Smartly shows the array type(except dynamic array).
+		 * Normal:
+		 *	field:TYPE VAR
+		 * If TYPE := TYPE[LEN], it is shown:
+		 *	field:TYPE VAR[LEN]
+		 */
+		struct ftrace_field *field = &t->fields[i];
+		const char *array_descriptor = strchr(field->type, '[');
 
-		fprintf(out, "\tfield:%s %s;\toffset:%d;\tsize:%d;\n",
-				f->type, f->name, f->offset, f->size);
+		if (!strncmp(field->type, "__data_loc", 10))
+			array_descriptor = NULL;
+
+		if (!array_descriptor) {
+			fprintf(out, "\tfield:%s %s;\toffset:%u;"
+					"\tsize:%u;\tsigned:%d;\n",
+					field->type, field->name, field->offset,
+					field->size, !!field->is_signed);
+		} else {
+			fprintf(out, "\tfield:%.*s %s%s;\toffset:%u;"
+					"\tsize:%u;\tsigned:%d;\n",
+					(int)(array_descriptor - field->type),
+					field->type, field->name,
+					array_descriptor, field->offset,
+					field->size, !!field->is_signed);
+		}
+
+		if (--common_field_count == 0)
+			fprintf(out, "\n");
 	}
 
-	/* TODO */
-	fprintf(out, "\nprint fmt: \"unknow fmt from dump\"\n");
+	fprintf(out, "\nprint fmt: %s\n", t->print_fmt);
+
 	fclose(out);
 
 	return 0;
@@ -918,9 +992,7 @@ static int ftrace_dump_event_types(const char *events_path)
 
 struct ring_buffer_per_cpu_stream {
 	struct ring_buffer_per_cpu *cpu_buffer;
-	ulong *pages;
 	void *curr_page;
-	int available_pages;
 	int curr_page_indx;
 
 	uint64_t ts;
@@ -932,43 +1004,11 @@ static
 int ring_buffer_per_cpu_stream_init(struct ring_buffer_per_cpu *cpu_buffer,
 		unsigned pages, struct ring_buffer_per_cpu_stream *s)
 {
-	unsigned i, count = 0;
-
 	s->cpu_buffer = cpu_buffer;
 	s->curr_page = malloc(PAGESIZE());
 	if (s->curr_page == NULL)
 		return -1;
 
-	s->pages = malloc(sizeof(ulong) * (pages + 1));
-	if (s->pages == NULL) {
-		free(s->curr_page);
-		return -1;
-	}
-
-	s->pages[count++] = cpu_buffer->reader_page;
-
-	if (cpu_buffer->reader_page == cpu_buffer->commit_page)
-		goto pages_done;
-
-	i = cpu_buffer->head_page_index;
-	for (;;) {
-		s->pages[count++] = cpu_buffer->pages[i];
-		
-		if (cpu_buffer->pages[i] == cpu_buffer->commit_page)
-			break;
-
-		i++;
-		if (i == pages)
-			i = 0;
-
-		if (i == cpu_buffer->head_page_index) {
-			/* cpu_buffer->commit_page may be corrupted */
-			break;
-		}
-	}
-
-pages_done:
-	s->available_pages = count;
 	s->curr_page_indx = -1;
 	return 0;
 }
@@ -977,7 +1017,6 @@ static
 void ring_buffer_per_cpu_stream_destroy(struct ring_buffer_per_cpu_stream *s)
 {
 	free(s->curr_page);
-	free(s->pages);
 }
 
 struct ftrace_event {
@@ -1003,7 +1042,8 @@ int ring_buffer_per_cpu_stream_get_page(struct ring_buffer_per_cpu_stream *s)
 {
 	ulong raw_page;
 
-	read_value(raw_page, s->pages[s->curr_page_indx], buffer_page, page);
+	read_value(raw_page, s->cpu_buffer->linear_pages[s->curr_page_indx],
+			buffer_page, page);
 
 	if (!readmem(raw_page, KVADDR, s->curr_page, PAGESIZE(),
 			"get page context", RETURN_ON_ERROR))
@@ -1027,18 +1067,18 @@ int ring_buffer_per_cpu_stream_pop_event(struct ring_buffer_per_cpu_stream *s,
 
 	res->data = NULL;
 
-	if (s->curr_page_indx >= s->available_pages)
+	if (s->curr_page_indx >= s->cpu_buffer->nr_linear_pages)
 		return -1;
 
 again:
 	if ((s->curr_page_indx == -1) || (s->offset >= s->commit)) {
 		s->curr_page_indx++;
 
-		if (s->curr_page_indx == s->available_pages)
+		if (s->curr_page_indx == s->cpu_buffer->nr_linear_pages)
 			return -1;
 
 		if (ring_buffer_per_cpu_stream_get_page(s) < 0) {
-			s->curr_page_indx = s->available_pages;
+			s->curr_page_indx = s->cpu_buffer->nr_linear_pages;
 			return -1;
 		}
 
@@ -1350,6 +1390,39 @@ static int dump_saved_cmdlines(const char *dump_tracing_dir)
 	return 0;
 }
 
+static int dump_kallsyms(const char *dump_tracing_dir)
+{
+	char path[PATH_MAX];
+	FILE *out;
+	int i;
+	struct syment *sp;
+
+	snprintf(path, sizeof(path), "%s/kallsyms", dump_tracing_dir);
+	out = fopen(path, "w");
+	if (out == NULL)
+		return -1;
+
+	for (sp = st->symtable; sp < st->symend; sp++)
+		fprintf(out, "%lx %c %s\n", sp->value, sp->type, sp->name);
+
+	for (i = 0; i < st->mods_installed; i++) {
+		struct load_module *lm = &st->load_modules[i];
+
+		for (sp = lm->mod_symtable; sp <= lm->mod_symend; sp++) {
+			if (!strncmp(sp->name, "_MODULE_", strlen("_MODULE_")))
+				continue;
+
+			fprintf(out, "%lx %c %s\t[%s]\n", sp->value, sp->type,
+					sp->name, lm->mod_name);
+		}
+	}
+
+	fclose(out);
+	return 0;
+}
+
+static int trace_cmd_data_output(int fd);
+
 static void ftrace_dump(int argc, char *argv[])
 {
 	int c;
@@ -1359,7 +1432,7 @@ static void ftrace_dump(int argc, char *argv[])
 	char path[PATH_MAX];
 	int ret;
 
-        while ((c = getopt(argc, argv, "sm")) != EOF) {
+        while ((c = getopt(argc, argv, "smt")) != EOF) {
                 switch(c)
 		{
 		case 's':
@@ -1368,6 +1441,23 @@ static void ftrace_dump(int argc, char *argv[])
 		case 'm':
 			dump_meta_data = 1;
 			break;
+		case 't':
+			if (dump_symbols || dump_meta_data || argc - optind > 1)
+				cmd_usage(pc->curcmd, SYNOPSIS);
+			else {
+				char *trace_dat;
+				int fd;
+
+				if (argc - optind == 0)
+					trace_dat = "trace.dat";
+				else if (argc - optind == 1)
+					trace_dat = argv[optind];
+				fd = open(trace_dat, O_WRONLY | O_CREAT
+						| O_TRUNC, 0644);
+				trace_cmd_data_output(fd);
+				close(fd);
+			}
+			return;
 		default:
 			cmd_usage(pc->curcmd, SYNOPSIS);
 			return;
@@ -1413,10 +1503,7 @@ static void ftrace_dump(int argc, char *argv[])
 
 	if (dump_symbols) {
 		/* Dump all symbols of the kernel */
-		fprintf(fp, "\n-s option hasn't been implemented.\n");
-		fprintf(fp, "symbols is not dumpped.\n");
-		fprintf(fp, "You can use `sym -l > %s/kallsyms`\n\n",
-				dump_tracing_dir);
+		dump_kallsyms(dump_tracing_dir);
 	}
 }
 
@@ -2508,6 +2595,9 @@ static char *help_ftrace[] = {
 "    the same as debugfs/tracing.",
 "    -m: also dump metadata of ftrace.",
 "    -s: also dump symbols of the kernel <not implemented>.",
+"trace dump -t [output-file-name]",
+"   dump ring_buffers and all meta data to a file that can",
+"   be parsed by trace-cmd. Default output file name is \"trace.dat\".",
 NULL
 };
 
@@ -2535,4 +2625,522 @@ int _fini(void)
 		ftrace_destroy();
 
 	return 1;
+}
+
+#define TRACE_CMD_FILE_VERSION_STRING "6"
+
+static inline int host_bigendian(void)
+{
+	unsigned char str[] = { 0x1, 0x2, 0x3, 0x4 };
+	unsigned int *ptr;
+
+	ptr = (unsigned int *)str;
+	return *ptr == 0x01020304;
+}
+
+static char *tmp_file_buf;
+static unsigned long long tmp_file_pos;
+static unsigned long long tmp_file_size;
+static int tmp_file_error;
+
+static int init_tmp_file(void)
+{
+	tmp_file_buf = malloc(4096);
+	if (tmp_file_buf == NULL)
+		return -1;
+
+	tmp_file_pos = 0;
+	tmp_file_size = 4096;
+	tmp_file_error = 0;
+
+	return 0;
+}
+
+static void destory_tmp_file(void)
+{
+	free(tmp_file_buf);
+}
+
+#define tmp_fprintf(fmt...)						\
+do {									\
+	char *__buf = tmp_file_buf;					\
+	unsigned long long __pos;					\
+									\
+	if (tmp_file_error)						\
+		break;							\
+	__pos = tmp_file_pos;						\
+	__pos += snprintf(__buf + __pos, tmp_file_size - __pos, fmt);	\
+	if (__pos > tmp_file_size) {					\
+		tmp_file_size = __pos + tmp_file_size;			\
+		__buf = realloc(__buf, tmp_file_size);			\
+		if (!__buf) {						\
+			tmp_file_error = 1;				\
+			break;						\
+		}							\
+		tmp_file_buf = __buf;					\
+		__pos = tmp_file_pos;					\
+		__pos += snprintf(__buf + __pos, tmp_file_size - __pos, fmt);\
+	}								\
+	tmp_file_pos = __pos;						\
+} while (0)
+
+static int tmp_file_record_size4(int fd)
+{
+	unsigned int size = tmp_file_pos;
+
+	if (tmp_file_error)
+		return -1;
+	if (write_and_check(fd, &size, 4))
+		return -1;
+	return 0;
+}
+
+static int tmp_file_record_size8(int fd)
+{
+	if (tmp_file_error)
+		return -1;
+	if (write_and_check(fd, &tmp_file_pos, 8))
+		return -1;
+	return 0;
+}
+
+static int tmp_file_flush(int fd)
+{
+	if (tmp_file_error)
+		return -1;
+	if (write_and_check(fd, tmp_file_buf, tmp_file_pos))
+		return -1;
+	tmp_file_pos = 0;
+	return 0;
+}
+
+static int save_initial_data(int fd)
+{
+	int page_size;
+	char buf[20];
+
+	if (write_and_check(fd, "\027\010\104tracing", 10))
+		return -1;
+
+	if (write_and_check(fd, TRACE_CMD_FILE_VERSION_STRING,
+				strlen(TRACE_CMD_FILE_VERSION_STRING) + 1))
+		return -1;
+
+	/* Crash ensure core file endian and the host endian are the same */
+	if (host_bigendian())
+		buf[0] = 1;
+	else
+		buf[0] = 0;
+
+	if (write_and_check(fd, buf, 1))
+		return -1;
+
+	/* save size of long (this may not be what the kernel is) */
+	buf[0] = sizeof(long);
+	if (write_and_check(fd, buf, 1))
+		return -1;
+
+	page_size = PAGESIZE();
+	if (write_and_check(fd, &page_size, 4))
+		return -1;
+
+	return 0;
+}
+
+static int save_header_files(int fd)
+{
+	/* save header_page */
+	if (write_and_check(fd, "header_page", 12))
+		return -1;
+
+	tmp_fprintf("\tfield: u64 timestamp;\toffset:0;\tsize:8;\tsigned:0;\n");
+
+	tmp_fprintf("\tfield: local_t commit;\toffset:8;\tsize:%u;\t"
+			"signed:1;\n", (unsigned int)sizeof(long));
+
+	tmp_fprintf("\tfield: int overwrite;\toffset:8;\tsize:%u;\tsigned:1;\n",
+			(unsigned int)sizeof(long));
+
+	tmp_fprintf("\tfield: char data;\toffset:%u;\tsize:%u;\tsigned:1;\n",
+			(unsigned int)(8 + sizeof(long)),
+			(unsigned int)(PAGESIZE() - 8 - sizeof(long)));
+
+	if (tmp_file_record_size8(fd))
+		return -1;
+	if (tmp_file_flush(fd))
+		return -1;
+
+	/* save header_event */
+	if (write_and_check(fd, "header_event", 13))
+		return -1;
+
+	tmp_fprintf(
+			"# compressed entry header\n"
+			"\ttype_len    :    5 bits\n"
+			"\ttime_delta  :   27 bits\n"
+			"\tarray       :   32 bits\n"
+			"\n"
+			"\tpadding     : type == 29\n"
+			"\ttime_extend : type == 30\n"
+			"\tdata max type_len  == 28\n"
+	);
+
+	if (tmp_file_record_size8(fd))
+		return -1;
+	if (tmp_file_flush(fd))
+		return -1;
+
+	return 0;
+}
+
+static int save_event_file(int fd, struct event_type *t)
+{
+	int i;
+	int common_field_count = 5;
+
+	tmp_fprintf("name: %s\n", t->name);
+	tmp_fprintf("ID: %d\n", t->id);
+	tmp_fprintf("format:\n");
+
+	for (i = t->nfields - 1; i >= 0; i--) {
+		/*
+		 * Smartly shows the array type(except dynamic array).
+		 * Normal:
+		 *	field:TYPE VAR
+		 * If TYPE := TYPE[LEN], it is shown:
+		 *	field:TYPE VAR[LEN]
+		 */
+		struct ftrace_field *field = &t->fields[i];
+		const char *array_descriptor = strchr(field->type, '[');
+
+		if (!strncmp(field->type, "__data_loc", 10))
+			array_descriptor = NULL;
+
+		if (!array_descriptor) {
+			tmp_fprintf("\tfield:%s %s;\toffset:%u;"
+					"\tsize:%u;\tsigned:%d;\n",
+					field->type, field->name, field->offset,
+					field->size, !!field->is_signed);
+		} else {
+			tmp_fprintf("\tfield:%.*s %s%s;\toffset:%u;"
+					"\tsize:%u;\tsigned:%d;\n",
+					(int)(array_descriptor - field->type),
+					field->type, field->name,
+					array_descriptor, field->offset,
+					field->size, !!field->is_signed);
+		}
+
+		if (--common_field_count == 0)
+			tmp_fprintf("\n");
+	}
+
+	tmp_fprintf("\nprint fmt: %s\n", t->print_fmt);
+
+	if (tmp_file_record_size8(fd))
+		return -1;
+	return tmp_file_flush(fd);
+}
+
+static int save_system_files(int fd, int *system_ids, int system_id)
+{
+	int i, total = 0;
+
+	for (i = 0; i < nr_event_types; i++) {
+		if (system_ids[i] == system_id)
+			total++;
+	}
+
+	if (write_and_check(fd, &total, 4))
+		return -1;
+
+	for (i = 0; i < nr_event_types; i++) {
+		if (system_ids[i] != system_id)
+			continue;
+
+		if (save_event_file(fd, event_types[i]))
+			return -1;
+	}
+
+	return 0;
+}
+
+static int save_events_files(int fd)
+{
+	int system_id = 1, *system_ids;
+	const char *system = "ftrace";
+	int i;
+	int nr_systems;
+
+	system_ids = calloc(sizeof(*system_ids), nr_event_types);
+	if (system_ids == NULL)
+		return -1;
+
+	for (;;) {
+		for (i = 0; i < nr_event_types; i++) {
+			if (system_ids[i])
+				continue;
+			if (!system) {
+				system = event_types[i]->system;
+				system_ids[i] = system_id;
+				continue;
+			}
+			if (!strcmp(event_types[i]->system, system))
+				system_ids[i] = system_id;
+		}
+		if (!system)
+			break;
+		system_id++;
+		system = NULL;
+	}
+
+	/* ftrace events */
+	if (save_system_files(fd, system_ids, 1))
+		goto fail;
+
+	/* other systems events */
+	nr_systems = system_id - 2;
+	if (write_and_check(fd, &nr_systems, 4))
+		goto fail;
+	for (system_id = 2; system_id < nr_systems + 2; system_id++) {
+		for (i = 0; i < nr_event_types; i++) {
+			if (system_ids[i] == system_id)
+				break;
+		}
+		if (write_and_check(fd, (void *)event_types[i]->system,
+				strlen(event_types[i]->system) + 1))
+			goto fail;
+		if (save_system_files(fd, system_ids, system_id))
+			goto fail;
+	}
+
+	free(system_ids);
+	return 0;
+
+fail:
+	free(system_ids);
+	return -1;
+}
+
+static int save_proc_kallsyms(int fd)
+{
+	int i;
+	struct syment *sp;
+
+	for (sp = st->symtable; sp < st->symend; sp++)
+		tmp_fprintf("%lx %c %s\n", sp->value, sp->type, sp->name);
+
+	for (i = 0; i < st->mods_installed; i++) {
+		struct load_module *lm = &st->load_modules[i];
+
+		for (sp = lm->mod_symtable; sp <= lm->mod_symend; sp++) {
+			if (!strncmp(sp->name, "_MODULE_", strlen("_MODULE_")))
+				continue;
+
+			tmp_fprintf("%lx %c %s\t[%s]\n", sp->value, sp->type,
+					sp->name, lm->mod_name);
+		}
+	}
+
+	if (tmp_file_record_size4(fd))
+		return -1;
+	return tmp_file_flush(fd);
+}
+
+static int save_ftrace_printk(int fd)
+{
+	struct syment *s, *e;
+	long bprintk_fmt_s, bprintk_fmt_e;
+	char string[4096];
+	long *address;
+	size_t i, count;
+
+	s = symbol_search("__start___trace_bprintk_fmt");
+	e = symbol_search("__stop___trace_bprintk_fmt");
+	if (s == NULL || e == NULL)
+		return -1;
+
+	bprintk_fmt_s = s->value;
+	bprintk_fmt_e = e->value;
+	count = (bprintk_fmt_e - bprintk_fmt_s) / sizeof(long);
+
+	if (count == 0) {
+		unsigned int size = 0;
+		return write_and_check(fd, &size, 4);
+	}
+
+	address = malloc(count * sizeof(long));
+	if (address == NULL)
+		return -1;
+
+	if (!readmem(bprintk_fmt_s, KVADDR, address, count * sizeof(long),
+			"get printk address", RETURN_ON_ERROR)) {
+		free(address);
+		return -1;
+	}
+
+	for (i = 0; i < count; i++) {
+		size_t len = read_string(address[i], string, sizeof(string));
+		if (!len) {
+			free(address);
+			return -1;
+		}
+
+		tmp_fprintf("0x%lx : \"", address[i]);
+
+		for (i = 0; string[i]; i++) {
+			switch (string[i]) {
+			case '\n':
+				tmp_fprintf("\\n");
+				break;
+			case '\t':
+				tmp_fprintf("\\t");
+				break;
+			case '\\':
+				tmp_fprintf("\\\\");
+				break;
+			case '"':
+				tmp_fprintf("\\\"");
+				break;
+			default:
+				tmp_fprintf("%c", string[i]);
+			}
+		}
+		tmp_fprintf("\"\n");
+	}
+
+	free(address);
+
+	if (tmp_file_record_size4(fd))
+		return -1;
+	return tmp_file_flush(fd);
+}
+
+static int save_ftrace_cmdlines(int fd)
+{
+	int i;
+	struct task_context *tc = FIRST_CONTEXT();
+
+	for (i = 0; i < RUNNING_TASKS(); i++)
+		tmp_fprintf("%d %s\n", (int)tc[i].pid, tc[i].comm);
+
+	if (tmp_file_record_size8(fd))
+		return -1;
+	return tmp_file_flush(fd);
+}
+
+static int save_res_data(int fd, int nr_cpu_buffers)
+{
+	unsigned short option = 0;
+
+	if (write_and_check(fd, &nr_cpu_buffers, 4))
+		return -1;
+
+	if (write_and_check(fd, "options  ", 10))
+		return -1;
+
+	if (write_and_check(fd, &option, 2))
+		return -1;
+
+	if (write_and_check(fd, "flyrecord", 10))
+		return -1;
+
+	return 0;
+}
+
+static int save_record_data(int fd, int nr_cpu_buffers)
+{
+	int i, j;
+	unsigned long long offset, buffer_offset;
+	void *page_tmp;
+
+	offset = lseek(fd, 0, SEEK_CUR);
+	offset += nr_cpu_buffers * 16;
+	offset = (offset + (PAGESIZE() - 1)) & ~(PAGESIZE() - 1);
+	buffer_offset = offset;
+
+	for (i = 0; i < nr_cpu_ids; i++) {
+		struct ring_buffer_per_cpu *cpu_buffer = &global_buffers[i];
+		unsigned long long buffer_size;
+
+		if (!cpu_buffer->kaddr)
+			continue;
+
+		buffer_size = PAGESIZE() * cpu_buffer->nr_linear_pages;
+		if (write_and_check(fd, &buffer_offset, 8))
+			return -1;
+		if (write_and_check(fd, &buffer_size, 8))
+			return -1;
+		buffer_offset += buffer_size;
+	}
+
+	page_tmp = malloc(PAGESIZE());
+	if (page_tmp == NULL)
+		return -1;
+
+	lseek(fd, offset, SEEK_SET);
+	for (i = 0; i < nr_cpu_ids; i++) {
+		struct ring_buffer_per_cpu *cpu_buffer = &global_buffers[i];
+
+		if (!cpu_buffer->kaddr)
+			continue;
+
+		for (j = 0; j < cpu_buffer->nr_linear_pages; j++) {
+			if (ftrace_dump_page(fd, cpu_buffer->linear_pages[i],
+					page_tmp) < 0) {
+				free(page_tmp);
+				return -1;
+			}
+		}
+	}
+
+	free(page_tmp);
+
+	return 0;
+}
+
+static int __trace_cmd_data_output(int fd)
+{
+	int i;
+	int nr_cpu_buffers = 0;
+
+	for (i = 0; i < nr_cpu_ids; i++) {
+		struct ring_buffer_per_cpu *cpu_buffer = &global_buffers[i];
+
+		if (!cpu_buffer->kaddr)
+			continue;
+
+		nr_cpu_buffers++;
+	}
+
+	if (save_initial_data(fd))
+		return -1;
+	if (save_header_files(fd))
+		return -1;
+	if (save_events_files(fd)) /* ftrace events and other systems events */
+		return -1;
+	if (save_proc_kallsyms(fd))
+		return -1;
+	if (save_ftrace_printk(fd))
+		return -1;
+	if (save_ftrace_cmdlines(fd))
+		return -1;
+	if (save_res_data(fd, nr_cpu_buffers))
+		return -1;
+	if (save_record_data(fd, nr_cpu_buffers))
+		return -1;
+
+	return 0;
+}
+
+static int trace_cmd_data_output(int fd)
+{
+	int ret;
+
+	if (init_tmp_file())
+		return -1;
+
+	ret = __trace_cmd_data_output(fd);
+	destory_tmp_file();
+
+	return ret;
 }
