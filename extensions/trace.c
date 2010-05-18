@@ -279,8 +279,12 @@ static void ftrace_destroy_buffers(struct ring_buffer_per_cpu *buffers)
 {
 	int i;
 
-	for (i = 0; i < nr_cpu_ids; i++)
+	for (i = 0; i < nr_cpu_ids; i++) {
+		if (!buffers[i].kaddr)
+			continue;
+
 		free(buffers[i].pages);
+	}
 }
 
 static int ftrace_init_buffers(struct ring_buffer_per_cpu *buffers,
@@ -913,6 +917,7 @@ static int ftrace_dump_event_types(const char *events_path)
 }
 
 struct ring_buffer_per_cpu_stream {
+	struct ring_buffer_per_cpu *cpu_buffer;
 	ulong *pages;
 	void *curr_page;
 	int available_pages;
@@ -929,6 +934,7 @@ int ring_buffer_per_cpu_stream_init(struct ring_buffer_per_cpu *cpu_buffer,
 {
 	unsigned i, count = 0;
 
+	s->cpu_buffer = cpu_buffer;
 	s->curr_page = malloc(PAGESIZE());
 	if (s->curr_page == NULL)
 		return -1;
@@ -1104,9 +1110,7 @@ static void __rbs_destroy(struct ring_buffer_stream *s, int *cpulist, int nr)
 	int cpu;
 
 	for (cpu = 0; cpu < nr; cpu++) {
-		if (!global_buffers[cpu].kaddr)
-			continue;
-		if (cpulist && !cpulist[cpu])
+		if (!s->ss[cpu].cpu_buffer)
 			continue;
 
 		ring_buffer_per_cpu_stream_destroy(s->ss + cpu);
@@ -1132,6 +1136,7 @@ int ring_buffer_stream_init(struct ring_buffer_stream *s, int *cpulist)
 	}
 
 	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+		s->ss[cpu].cpu_buffer = NULL;
 		s->es[cpu].data = NULL;
 
 		if (!global_buffers[cpu].kaddr)
@@ -1183,7 +1188,7 @@ static int ring_buffer_stream_pop_event(struct ring_buffer_stream *s,
 
 	if (s->popped_cpu == nr_cpu_ids) {
 		for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
-			if (!global_buffers[cpu].kaddr)
+			if (!s->ss[cpu].cpu_buffer)
 				continue;
 
 			ring_buffer_per_cpu_stream_pop_event(s->ss + cpu,
