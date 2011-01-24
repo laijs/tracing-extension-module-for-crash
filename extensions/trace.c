@@ -785,20 +785,19 @@ work:
 	return -1;
 }
 
-static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
+static int ftrace_init_event_fields(ulong fields_head, int *pnfields,
+		struct ftrace_field **pfields)
 {
-	ulong fields_addr, pos;
+	ulong pos;
 
 	int nfields = 0, max_fields = 16;
 	struct ftrace_field *fields = NULL;
 
-	if (ftrace_get_event_type_fields(call, &fields_addr) < 0)
-		return -1;
-	read_value(pos, fields_addr, list_head, next);
+	read_value(pos, fields_head, list_head, next);
 
 	if (pos == 0) {
 		if (verbose)
-			fprintf(fp, "no field %lu\n", call);
+			fprintf(fp, "no field, head: %lu\n", fields_head);
 		return 0;
 	}
 
@@ -806,7 +805,7 @@ static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
 	if (fields == NULL)
 		return -1;
 
-	while (pos != fields_addr) {
+	while (pos != fields_head) {
 		ulong field;
 		ulong name_addr, type_addr;
 		char field_name[128], field_type[128];
@@ -860,8 +859,8 @@ static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
 		read_value(pos, pos, list_head, next);
 	}
 
-	aevent_type->nfields = nfields;
-	aevent_type->fields = fields;
+	*pnfields = nfields;
+	*pfields = fields;
 
 	return 0;
 
@@ -873,6 +872,17 @@ out_fail:
 
 	free(fields);
 	return -1;
+}
+
+static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
+{
+	ulong fields_head;
+
+	if (ftrace_get_event_type_fields(call, &fields_head) < 0)
+		return -1;
+
+	return ftrace_init_event_fields(fields_head, &aevent_type->nfields,
+			&aevent_type->fields);
 }
 
 static void ftrace_destroy_event_types(void)
