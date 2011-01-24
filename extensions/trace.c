@@ -662,23 +662,127 @@ static void event_generic_print_fmt_print(struct event_type *t,
 static void event_default_print(struct event_type *t,
 		struct format_context *fc);
 
+static int syscall_get_enter_fields(ulong call, ulong *fields)
+{
+	static int inited;
+	static int data_offset;
+	static int enter_fields_offset;
+
+	ulong metadata;
+
+	if (inited)
+		goto work;
+
+	inited = 1;
+	data_offset = MEMBER_OFFSET("ftrace_event_call", "data");
+	if (data_offset < 0)
+		return -1;
+
+	enter_fields_offset = MEMBER_OFFSET("syscall_metadata", "enter_fields");
+	if (enter_fields_offset < 0)
+		return -1;
+
+work:
+	if (data_offset < 0 || enter_fields_offset < 0)
+		return -1;
+
+	if (!readmem(call + data_offset, KVADDR, &metadata, sizeof(metadata),
+			"read ftrace_event_call data", RETURN_ON_ERROR))
+		return -1;
+
+	*fields = metadata + enter_fields_offset;
+	return 0;
+}
+
+static int syscall_get_exit_fields(ulong call, ulong *fields)
+{
+	static int inited;
+	static ulong syscall_exit_fields_value;
+
+	if (!inited) {
+		struct syment *sp;
+
+		if (!(sp = symbol_search("syscall_exit_fields"))) {
+			inited = -1;
+		} else {
+			syscall_exit_fields_value = sp->value;
+			inited = 1;
+		}
+	}
+
+	if (inited == -1)
+		return -1;
+
+	*fields = syscall_exit_fields_value;
+
+	return 0;
+}
+
 static
 int ftrace_get_event_type_fields(ulong call, ulong *fields)
 {
 	static int inited;
 	static int fields_offset;
+	static int class_offset;
+	static int get_fields_offset;
+	static ulong syscall_get_enter_fields_value;
+	static ulong syscall_get_exit_fields_value;
 
-	if (!inited) {
-		inited = 1;
-		fields_offset = MEMBER_OFFSET("ftrace_event_call", "fields");
-	}
+	struct syment *sp;
+	ulong class, get_fields;
 
+	if (inited)
+		goto work;
+
+	inited = 1;
+	fields_offset = MEMBER_OFFSET("ftrace_event_call", "fields");
+
+	class_offset = MEMBER_OFFSET("ftrace_event_call", "class");
+	if (class_offset < 0)
+		goto work;
+
+	inited = 2;
+	fields_offset = MEMBER_OFFSET("ftrace_event_class", "fields");
 	if (fields_offset < 0)
 		return -1;
 
-	*fields = call + fields_offset;
+	get_fields_offset = MEMBER_OFFSET("ftrace_event_class", "get_fields");
+	if ((sp = symbol_search("syscall_get_enter_fields")) != NULL)
+		syscall_get_enter_fields_value = sp->value;
+	if ((sp = symbol_search("syscall_get_exit_fields")) != NULL)
+		syscall_get_exit_fields_value = sp->value;
 
-	return 0;
+work:
+	if (fields_offset < 0)
+		return -1;
+
+	if (inited == 1) {
+		*fields = call + fields_offset;
+		return 0;
+	}
+
+	if (!readmem(call + class_offset, KVADDR, &class, sizeof(class),
+			"read ftrace_event_call class", RETURN_ON_ERROR))
+		return -1;
+
+	if (!readmem(class + get_fields_offset, KVADDR, &get_fields,
+			sizeof(get_fields), "read ftrace_event_call get_fields",
+			RETURN_ON_ERROR))
+		return -1;
+
+	if (!get_fields) {
+		*fields = class + fields_offset;
+		return 0;
+	}
+
+	if (get_fields == syscall_get_enter_fields_value)
+		return syscall_get_enter_fields(call, fields);
+
+	if (get_fields == syscall_get_exit_fields_value)
+		return syscall_get_exit_fields(call, fields);
+
+	fprintf(fp, "Unkown get_fields function\n");
+	return -1;
 }
 
 static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
