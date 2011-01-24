@@ -136,10 +136,17 @@ static int write_and_check(int fd, void *data, size_t size)
 #define PATH_MAX 4096
 #endif
 
-static void init_offsets(void)
+static int init_offsets(void)
 {
-#define init_offset(struct, member)					\
-	koffset(struct, member) = MEMBER_OFFSET(#struct, #member);
+#define init_offset(struct, member) do {				\
+		koffset(struct, member) = MEMBER_OFFSET(#struct, #member);\
+		if (koffset(struct, member) < 0) {			\
+			fprintf(fp, "failed to init the offset, struct:"\
+				#struct ", member:" #member);		\
+			return -1;					\
+		}							\
+	} while (0)
+
 
 	init_offset(trace_array, buffer);
 	init_offset(tracer, name);
@@ -183,6 +190,8 @@ static void init_offsets(void)
 	init_offset(ftrace_event_field, offset);
 	init_offset(ftrace_event_field, size);
 	init_offset(ftrace_event_field, is_signed);
+
+	return 0;
 #undef init_offset
 }
 
@@ -480,7 +489,8 @@ static int ftrace_init(void)
 	if (!try_get_symbol_data("nr_cpu_ids", sizeof(int), &nr_cpu_ids))
 		nr_cpu_ids = 1;
 
-	init_offsets();
+	if (init_offsets() < 0)
+		return -1;
 	print_offsets();
 
 	if (ftrace_int_global_trace() < 0)
