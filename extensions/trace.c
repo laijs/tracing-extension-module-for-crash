@@ -878,6 +878,15 @@ int ftrace_get_event_type_id(ulong call, int *id)
 	if (!inited) {
 		inited = 1;
 		id_offset = MEMBER_OFFSET("ftrace_event_call", "id");
+
+		if (id_offset < 0) {
+			/* id = call->event.type */
+			int f1 = MEMBER_OFFSET("ftrace_event_call", "event");
+			int f2 = MEMBER_OFFSET("trace_event", "type");
+
+			if (f1 >= 0 && f2 >= 0)
+				id_offset = f1 + f2;
+		}
 	}
 
 	if (id_offset < 0)
