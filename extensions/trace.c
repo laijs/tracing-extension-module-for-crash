@@ -822,18 +822,37 @@ int ftrace_get_event_type_system(ulong call, char *system, int len)
 {
 	static int inited;
 	static int sys_offset;
+	static int class_offset;
 
+	ulong ptr = call;
 	ulong sys_addr;
 
-	if (!inited) {
-		inited = 1;
-		sys_offset = MEMBER_OFFSET("ftrace_event_call", "system");
-	}
+	if (inited)
+		goto work;
 
+	inited = 1;
+	sys_offset = MEMBER_OFFSET("ftrace_event_call", "system");
+
+	if (sys_offset >= 0)
+		goto work;
+
+	class_offset = MEMBER_OFFSET("ftrace_event_call", "class");
+	if (class_offset < 0)
+		return -1;
+
+	sys_offset = MEMBER_OFFSET("ftrace_event_class", "system");
+	inited = 2;
+
+work:
 	if (sys_offset < 0)
 		return -1;
 
-	if (!readmem(call + sys_offset, KVADDR, &sys_addr, sizeof(sys_addr),
+	if (inited == 2 && !readmem(call + class_offset, KVADDR, &ptr,
+			sizeof(ptr), "read ftrace_event_call class_addr",
+			RETURN_ON_ERROR))
+		return -1;
+
+	if (!readmem(ptr + sys_offset, KVADDR, &sys_addr, sizeof(sys_addr),
 			"read ftrace_event_call sys_addr", RETURN_ON_ERROR))
 		return -1;
 
