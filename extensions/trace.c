@@ -995,8 +995,48 @@ work:
 	return 0;
 }
 
+static int read_long_string(ulong kvaddr, char **buf)
+{
+	char strbuf[MIN_PAGE_SIZE], *ret_buf = NULL;
+	ulong kp;
+	int cnt1, cnt2, size;
+
+again:
+	kp = kvaddr;
+	size = 0;
+
+	for (;;) {
+		cnt1 = MIN_PAGE_SIZE - (kp & (MIN_PAGE_SIZE-1));
+
+		if (!readmem(kp, KVADDR, strbuf, cnt1,
+		    "readstring characters", QUIET|RETURN_ON_ERROR))
+			return -1;
+
+		cnt2 = strnlen(strbuf, cnt1);
+		if (ret_buf)
+			memcpy(ret_buf + size, strbuf, cnt2);
+		kp += cnt2;
+		size += cnt2;
+
+		if (cnt2 < cnt1) {
+			if (ret_buf) {
+				break;
+			} else {
+				ret_buf = malloc(size + 1);
+				if (!ret_buf)
+					return -1;
+				goto again;
+			}
+		}
+	}
+
+	ret_buf[size] = '\0';
+	*buf = ret_buf;
+	return size;
+}
+
 static
-int ftrace_get_event_type_print_fmt(ulong call, char *print_fmt, int len)
+int ftrace_get_event_type_print_fmt(ulong call, char **print_fmt)
 {
 	static int inited;
 	static int fmt_offset;
@@ -1015,10 +1055,7 @@ int ftrace_get_event_type_print_fmt(ulong call, char *print_fmt, int len)
 			"read ftrace_event_call fmt_addr", RETURN_ON_ERROR))
 		return -1;
 
-	if (!read_string(fmt_addr, print_fmt, len))
-		return -1;
-
-	return 0;
+	return read_long_string(fmt_addr, print_fmt);
 }
 
 static
@@ -1064,7 +1101,7 @@ static int ftrace_init_event_types(void)
 	read_value(event, ftrace_events, list_head, next);
 	while (event != ftrace_events) {
 		ulong call;
-		char name[128], system[128], print_fmt[4096];
+		char name[128], system[128], *print_fmt;
 		int id;
 
 		call = event - koffset(ftrace_event_call, list);
@@ -1073,7 +1110,7 @@ static int ftrace_init_event_types(void)
 		if (ftrace_get_event_type_id(call, &id) < 0 ||
 		    ftrace_get_event_type_name(call, name, 128) < 0 ||
 		    ftrace_get_event_type_system(call, system, 128) < 0 ||
-		    ftrace_get_event_type_print_fmt(call, print_fmt, 4096) < 0)
+		    ftrace_get_event_type_print_fmt(call, &print_fmt) < 0)
 			goto out_fail;
 
 		/* Enlarge event types array when need */
@@ -1083,20 +1120,24 @@ static int ftrace_init_event_types(void)
 			max_types = 2 * nr_event_types;
 			tmp = realloc(event_types,
 					sizeof(*event_types) * max_types);
-			if (tmp == NULL)
+			if (tmp == NULL) {
+				free(print_fmt);
 				goto out_fail;
+			}
 
 			event_types = tmp;
 		}
 
 		/* Create a event type */
 		aevent_type = malloc(sizeof(*aevent_type));
-		if (aevent_type == NULL)
+		if (aevent_type == NULL) {
+			free(print_fmt);
 			goto out_fail;
+		}
 
 		aevent_type->system = strdup(system);
 		aevent_type->name = strdup(name);
-		aevent_type->print_fmt = strdup(print_fmt);
+		aevent_type->print_fmt = print_fmt;
 		aevent_type->id = id;
 		aevent_type->nfields = 0;
 		aevent_type->fields = NULL;
