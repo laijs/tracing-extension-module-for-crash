@@ -3085,7 +3085,7 @@ static int save_record_data(int fd, int nr_cpu_buffers)
 			continue;
 
 		for (j = 0; j < cpu_buffer->nr_linear_pages; j++) {
-			if (ftrace_dump_page(fd, cpu_buffer->linear_pages[i],
+			if (ftrace_dump_page(fd, cpu_buffer->linear_pages[j],
 					page_tmp) < 0) {
 				free(page_tmp);
 				return -1;
