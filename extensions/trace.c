@@ -51,11 +51,6 @@ static int koffset(buffer_page, page);
 static int koffset(list_head, next);
 
 static int koffset(ftrace_event_call, list);
-static int koffset(ftrace_event_call, name);
-static int koffset(ftrace_event_call, system);
-static int koffset(ftrace_event_call, print_fmt);
-static int koffset(ftrace_event_call, id);
-static int koffset(ftrace_event_call, fields);
 
 static int koffset(ftrace_event_field, link);
 static int koffset(ftrace_event_field, name);
@@ -178,11 +173,6 @@ static int init_offsets(void)
 	init_offset(list_head, next);
 
 	init_offset(ftrace_event_call, list);
-	init_offset(ftrace_event_call, name);
-	init_offset(ftrace_event_call, system);
-	init_offset(ftrace_event_call, print_fmt);
-	init_offset(ftrace_event_call, id);
-	init_offset(ftrace_event_call, fields);
 
 	init_offset(ftrace_event_field, link);
 	init_offset(ftrace_event_field, name);
@@ -227,11 +217,6 @@ static void print_offsets(void)
 	print_offset(list_head, next);
 
 	print_offset(ftrace_event_call, list);
-	print_offset(ftrace_event_call, name);
-	print_offset(ftrace_event_call, system);
-	print_offset(ftrace_event_call, print_fmt);
-	print_offset(ftrace_event_call, id);
-	print_offset(ftrace_event_call, fields);
 
 	print_offset(ftrace_event_field, link);
 	print_offset(ftrace_event_field, name);
@@ -677,6 +662,25 @@ static void event_generic_print_fmt_print(struct event_type *t,
 static void event_default_print(struct event_type *t,
 		struct format_context *fc);
 
+static
+int ftrace_get_event_type_fields(ulong call, ulong *fields)
+{
+	static int inited;
+	static int fields_offset;
+
+	if (!inited) {
+		inited = 1;
+		fields_offset = MEMBER_OFFSET("ftrace_event_call", "fields");
+	}
+
+	if (fields_offset < 0)
+		return -1;
+
+	*fields = call + fields_offset;
+
+	return 0;
+}
+
 static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
 {
 	ulong fields_addr, pos;
@@ -684,7 +688,8 @@ static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
 	int nfields = 0, max_fields = 16;
 	struct ftrace_field *fields = NULL;
 
-	fields_addr = call + koffset(ftrace_event_call, fields);
+	if (ftrace_get_event_type_fields(call, &fields_addr) < 0)
+		return -1;
 	read_value(pos, fields_addr, list_head, next);
 
 	if (pos == 0) {
@@ -786,6 +791,105 @@ static void ftrace_destroy_event_types(void)
 	free(event_types);
 }
 
+static
+int ftrace_get_event_type_name(ulong call, char *name, int len)
+{
+	static int inited;
+	static int name_offset;
+
+	ulong name_addr;
+
+	if (!inited) {
+		inited = 1;
+		name_offset = MEMBER_OFFSET("ftrace_event_call", "name");
+	}
+
+	if (name_offset < 0)
+		return -1;
+
+	if (!readmem(call + name_offset, KVADDR, &name_addr, sizeof(name_addr),
+			"read ftrace_event_call name_addr", RETURN_ON_ERROR))
+		return -1;
+
+	if (!read_string(name_addr, name, len))
+		return -1;
+
+	return 0;
+}
+
+static
+int ftrace_get_event_type_system(ulong call, char *system, int len)
+{
+	static int inited;
+	static int sys_offset;
+
+	ulong sys_addr;
+
+	if (!inited) {
+		inited = 1;
+		sys_offset = MEMBER_OFFSET("ftrace_event_call", "system");
+	}
+
+	if (sys_offset < 0)
+		return -1;
+
+	if (!readmem(call + sys_offset, KVADDR, &sys_addr, sizeof(sys_addr),
+			"read ftrace_event_call sys_addr", RETURN_ON_ERROR))
+		return -1;
+
+	if (!read_string(sys_addr, system, len))
+		return -1;
+
+	return 0;
+}
+
+static
+int ftrace_get_event_type_print_fmt(ulong call, char *print_fmt, int len)
+{
+	static int inited;
+	static int fmt_offset;
+
+	ulong fmt_addr;
+
+	if (!inited) {
+		inited = 1;
+		fmt_offset = MEMBER_OFFSET("ftrace_event_call", "print_fmt");
+	}
+
+	if (fmt_offset < 0)
+		return -1;
+
+	if (!readmem(call + fmt_offset, KVADDR, &fmt_addr, sizeof(fmt_addr),
+			"read ftrace_event_call fmt_addr", RETURN_ON_ERROR))
+		return -1;
+
+	if (!read_string(fmt_addr, print_fmt, len))
+		return -1;
+
+	return 0;
+}
+
+static
+int ftrace_get_event_type_id(ulong call, int *id)
+{
+	static int inited;
+	static int id_offset;
+
+	if (!inited) {
+		inited = 1;
+		id_offset = MEMBER_OFFSET("ftrace_event_call", "id");
+	}
+
+	if (id_offset < 0)
+		return -1;
+
+	if (!readmem(call + id_offset, KVADDR, id, sizeof(*id),
+			"read ftrace_event_call id", RETURN_ON_ERROR))
+		return -1;
+
+	return 0;
+}
+
 static int ftrace_init_event_types(void)
 {
 	ulong event;
@@ -799,23 +903,16 @@ static int ftrace_init_event_types(void)
 	read_value(event, ftrace_events, list_head, next);
 	while (event != ftrace_events) {
 		ulong call;
-		ulong name_addr, system_addr, print_fmt_addr;
 		char name[128], system[128], print_fmt[4096];
 		int id;
 
 		call = event - koffset(ftrace_event_call, list);
 
 		/* Read a event type from the core */
-		read_value(id, call, ftrace_event_call, id);
-		read_value(name_addr, call, ftrace_event_call, name);
-		read_value(system_addr, call, ftrace_event_call, system);
-		read_value(print_fmt_addr, call, ftrace_event_call, print_fmt);
-
-		if (!read_string(name_addr, name, 128))
-			goto out_fail;
-		if (!read_string(system_addr, system, 128))
-			goto out_fail;
-		if (!read_string(print_fmt_addr, print_fmt, 4096))
+		if (ftrace_get_event_type_id(call, &id) < 0 ||
+		    ftrace_get_event_type_name(call, name, 128) < 0 ||
+		    ftrace_get_event_type_system(call, system, 128) < 0 ||
+		    ftrace_get_event_type_print_fmt(call, print_fmt, 4096) < 0)
 			goto out_fail;
 
 		/* Enlarge event types array when need */
