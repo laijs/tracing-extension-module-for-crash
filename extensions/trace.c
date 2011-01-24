@@ -1080,8 +1080,10 @@ int ftrace_get_event_type_print_fmt(ulong call, char **print_fmt)
 		fmt_offset = MEMBER_OFFSET("ftrace_event_call", "print_fmt");
 	}
 
-	if (fmt_offset < 0)
-		return -1;
+	if (fmt_offset < 0) {
+		*print_fmt = strdup("Unknown print_fmt");
+		return 0;
+	}
 
 	if (!readmem(call + fmt_offset, KVADDR, &fmt_addr, sizeof(fmt_addr),
 			"read ftrace_event_call fmt_addr", RETURN_ON_ERROR))
