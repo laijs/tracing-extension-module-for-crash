@@ -697,6 +697,38 @@ work:
 	return 0;
 }
 
+static int syscall_get_exit_fields_old(ulong call, ulong *fields)
+{
+	static int inited;
+	static int data_offset;
+	static int exit_fields_offset;
+
+	ulong metadata;
+
+	if (inited)
+		goto work;
+
+	inited = 1;
+	data_offset = MEMBER_OFFSET("ftrace_event_call", "data");
+	if (data_offset < 0)
+		return -1;
+
+	exit_fields_offset = MEMBER_OFFSET("syscall_metadata", "exit_fields");
+	if (exit_fields_offset < 0)
+		return -1;
+
+work:
+	if (data_offset < 0 || exit_fields_offset < 0)
+		return -1;
+
+	if (!readmem(call + data_offset, KVADDR, &metadata, sizeof(metadata),
+			"read ftrace_event_call data", RETURN_ON_ERROR))
+		return -1;
+
+	*fields = metadata + exit_fields_offset;
+	return 0;
+}
+
 static int syscall_get_exit_fields(ulong call, ulong *fields)
 {
 	static int inited;
@@ -714,7 +746,7 @@ static int syscall_get_exit_fields(ulong call, ulong *fields)
 	}
 
 	if (inited == -1)
-		return -1;
+		return syscall_get_exit_fields_old(call, fields);
 
 	*fields = syscall_exit_fields_value;
 
