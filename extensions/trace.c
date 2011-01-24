@@ -652,6 +652,9 @@ static struct event_type *event_type_cache[MAX_CACHE_ID];
 static struct event_type **event_types;
 static int nr_event_types;
 
+static struct ftrace_field *ftrace_common_fields;
+static int ftrace_common_fields_count;
+
 /*
  * TODO: implement event_generic_print_fmt_print() when the print fmt
  * in tracing/events/$SYSTEM/$TRACE/format becomes a will-defined
@@ -885,6 +888,21 @@ static int ftrace_init_event_type(ulong call, struct event_type *aevent_type)
 			&aevent_type->fields);
 }
 
+static int ftrace_init_common_fields(void)
+{
+	ulong ftrace_common_fields_head;
+	struct syment *sp;
+
+	sp = symbol_search("ftrace_common_fields");
+	if (!sp)
+		return 0;
+
+	ftrace_common_fields_head = sp->value;
+
+	return ftrace_init_event_fields(ftrace_common_fields_head,
+			&ftrace_common_fields_count, &ftrace_common_fields);
+}
+
 static void ftrace_destroy_event_types(void)
 {
 	int i, j;
@@ -903,6 +921,7 @@ static void ftrace_destroy_event_types(void)
 	}
 
 	free(event_types);
+	free(ftrace_common_fields);
 }
 
 static
@@ -1102,6 +1121,9 @@ static int ftrace_init_event_types(void)
 		/* Advance to the next event type */
 		read_value(event, event, list_head, next);
 	}
+
+	if (ftrace_init_common_fields() < 0)
+		goto out_fail;
 
 	return 0;
 
