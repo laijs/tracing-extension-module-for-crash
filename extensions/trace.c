@@ -1143,6 +1143,12 @@ struct ftrace_field *find_event_field(struct event_type *t, const char *name)
 	int i;
 	struct ftrace_field *f;
 
+	for (i = 0; i < ftrace_common_fields_count; i++) {
+		f = ftrace_common_fields + i;
+		if (!strcmp(name, f->name))
+			return f;
+	}
+
 	for (i = 0; i < t->nfields; i++) {
 		f = &t->fields[i];
 		if (!strcmp(name, f->name))
@@ -1182,12 +1188,15 @@ struct event_type *find_event_type_by_name(const char *system, const char *name)
 	return NULL;
 }
 
+#define default_common_field_count 5
+
 static int ftrace_dump_event_type(struct event_type *t, const char *path)
 {
 	char format_path[PATH_MAX];
 	FILE *out;
-	int i;
-	int common_field_count = 5;
+	int i, nfields;
+	struct ftrace_field *fields;
+	int printed_common_field = 0;
 
 	snprintf(format_path, sizeof(format_path), "%s/format", path);
 	out = fopen(format_path, "w");
@@ -1198,7 +1207,16 @@ static int ftrace_dump_event_type(struct event_type *t, const char *path)
 	fprintf(out, "ID: %d\n", t->id);
 	fprintf(out, "format:\n");
 
-	for (i = t->nfields - 1; i >= 0; i--) {
+	if (ftrace_common_fields_count) {
+		nfields = ftrace_common_fields_count;
+		fields = ftrace_common_fields;
+	} else {
+		nfields = default_common_field_count;
+		fields = &t->fields[t->nfields - nfields];
+	}
+
+again:
+	for (i = nfields - 1; i >= 0; i--) {
 		/*
 		 * Smartly shows the array type(except dynamic array).
 		 * Normal:
@@ -1206,7 +1224,7 @@ static int ftrace_dump_event_type(struct event_type *t, const char *path)
 		 * If TYPE := TYPE[LEN], it is shown:
 		 *	field:TYPE VAR[LEN]
 		 */
-		struct ftrace_field *field = &t->fields[i];
+		struct ftrace_field *field = &fields[i];
 		const char *array_descriptor = strchr(field->type, '[');
 
 		if (!strncmp(field->type, "__data_loc", 10))
@@ -1225,9 +1243,19 @@ static int ftrace_dump_event_type(struct event_type *t, const char *path)
 					array_descriptor, field->offset,
 					field->size, !!field->is_signed);
 		}
+	}
 
-		if (--common_field_count == 0)
-			fprintf(out, "\n");
+	if (!printed_common_field) {
+		fprintf(out, "\n");
+
+		if (ftrace_common_fields_count)
+			nfields = t->nfields;
+		else
+			nfields = t->nfields - default_common_field_count;
+		fields = t->fields;
+
+		printed_common_field = 1;
+		goto again;
 	}
 
 	fprintf(out, "\nprint fmt: %s\n", t->print_fmt);
@@ -3066,14 +3094,24 @@ static int save_header_files(int fd)
 
 static int save_event_file(int fd, struct event_type *t)
 {
-	int i;
-	int common_field_count = 5;
+	int i, nfields;
+	struct ftrace_field *fields;
+	int printed_common_field = 0;
 
 	tmp_fprintf("name: %s\n", t->name);
 	tmp_fprintf("ID: %d\n", t->id);
 	tmp_fprintf("format:\n");
 
-	for (i = t->nfields - 1; i >= 0; i--) {
+	if (ftrace_common_fields_count) {
+		nfields = ftrace_common_fields_count;
+		fields = ftrace_common_fields;
+	} else {
+		nfields = default_common_field_count;
+		fields = &t->fields[t->nfields - nfields];
+	}
+
+again:
+	for (i = nfields - 1; i >= 0; i--) {
 		/*
 		 * Smartly shows the array type(except dynamic array).
 		 * Normal:
@@ -3081,7 +3119,7 @@ static int save_event_file(int fd, struct event_type *t)
 		 * If TYPE := TYPE[LEN], it is shown:
 		 *	field:TYPE VAR[LEN]
 		 */
-		struct ftrace_field *field = &t->fields[i];
+		struct ftrace_field *field = &fields[i];
 		const char *array_descriptor = strchr(field->type, '[');
 
 		if (!strncmp(field->type, "__data_loc", 10))
@@ -3100,9 +3138,19 @@ static int save_event_file(int fd, struct event_type *t)
 					array_descriptor, field->offset,
 					field->size, !!field->is_signed);
 		}
+	}
 
-		if (--common_field_count == 0)
-			tmp_fprintf("\n");
+	if (!printed_common_field) {
+		tmp_fprintf("\n");
+
+		if (ftrace_common_fields_count)
+			nfields = t->nfields;
+		else
+			nfields = t->nfields - default_common_field_count;
+		fields = t->fields;
+
+		printed_common_field = 1;
+		goto again;
 	}
 
 	tmp_fprintf("\nprint fmt: %s\n", t->print_fmt);
